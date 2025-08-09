@@ -35,8 +35,8 @@ class robot:
         step_time: float = 0.1,
         kinematics: Optional[str] = None,
         vertices: Optional[Union[list[float], np.ndarray]] = None,
-        max_speed: list[float] = [inf, inf],
-        max_acce: list[float] = [inf, inf],
+        max_speed: list[float] = None,
+        max_acce: list[float] = None,
         wheelbase: Optional[float] = None,
         length: Optional[float] = None,
         width: Optional[float] = None,
@@ -57,6 +57,26 @@ class robot:
         self.L = wheelbase
 
         self.kinematics = kinematics
+
+        if max_speed is None:
+            if kinematics == 'omni':
+                max_speed = [inf, inf, inf]
+            else:
+                max_speed = [inf, inf]
+        
+        if max_acce is None:
+            if kinematics == 'omni':
+                max_acce = [inf, inf, inf]
+            else:
+                max_acce = [inf, inf]
+
+        if kinematics == 'omni':
+            if len(max_speed) != 3 or len(max_acce) != 3:
+                raise ValueError("For 'omni' kinematics, max_speed and max_acce must be a list of 3 floats [vx, vy, w].")
+        else:
+            if len(max_speed) != 2 or len(max_acce) != 2:
+                raise ValueError(f"For '{kinematics}' kinematics, max_speed and max_acce must be a list of 2 floats.")
+
         self.max_speed = np.c_[max_speed] if isinstance(max_speed, list) else max_speed
         self.max_acce = np.c_[max_acce] if isinstance(max_acce, list) else max_acce
 
@@ -68,7 +88,7 @@ class robot:
         self.speed_bound = self.max_speed
         self.acce_bound = self.max_acce * self.dt
 
-        self.state_dim = 2
+        self.state_dim = 3
         self.name = kwargs.get("name", self.kinematics + "_robot" + '_default') 
 
 
@@ -79,7 +99,15 @@ class robot:
         """
 
         self.indep_s = cp.Variable((3, self.T + 1), name="state")  # t0 - T
-        self.indep_u = cp.Variable((2, self.T), name="vel")  # t1 - T
+
+        if self.kinematics in ['diff', 'acker']:
+            u_dim = 2
+        elif self.kinematics == 'omni':
+            u_dim = 3
+        else:
+            raise ValueError(f"Undifined kinematics: {self.kinematics}")
+
+        self.indep_u = cp.Variable((u_dim, self.T), name="vel")  # t1 - T
         
         indep_list = (
             [self.indep_s, self.indep_u]
@@ -94,20 +122,30 @@ class robot:
         '''
         state parameters:
             - para_gamma_a: q*reference state, 3 * (T+1)
-            - para_gamma_b: p*reference speed array, T
+            - para_gamma_b: p*reference speed array, T (scalar reference for all kinematics)
+            - para_gamma_b_omni: p*reference velocity vector, 3 * T (only for omni kinematics)
             - para_s: nominal state, 3 * (T+1)
             - para_A_list, para_B_list, para_C_list: for state transition model
         '''
 
         self.para_s = cp.Parameter((3, self.T+1), name='para_state') 
         self.para_gamma_a = cp.Parameter((3, self.T+1), name='para_gamma_a') 
-        self.para_gamma_b = cp.Parameter((self.T,), name='para_gamma_b')
+
+        if self.kinematics == 'omni':
+            self.para_gamma_b_omni = cp.Parameter((3, self.T), name='para_gamma_b_omni')
+            self.para_gamma_b = cp.Parameter((self.T,), name='para_gamma_b')
+            gamma_b_params = [self.para_gamma_b, self.para_gamma_b_omni]
+        else:
+            self.para_gamma_b = cp.Parameter((self.T,), name='para_gamma_b')
+            gamma_b_params = [self.para_gamma_b]    
+
+        u_dim = 3 if self.kinematics == 'omni' else 2
 
         self.para_A_list = [ cp.Parameter((3, 3), name='para_A_'+str(t)) for t in range(self.T)]
-        self.para_B_list = [ cp.Parameter((3, 2), name='para_B_'+str(t)) for t in range(self.T)]
+        self.para_B_list = [ cp.Parameter((3, u_dim), name='para_B_'+str(t)) for t in range(self.T)]
         self.para_C_list = [ cp.Parameter((3, 1), name='para_C_'+str(t)) for t in range(self.T)]
 
-        return [self.para_s, self.para_gamma_a, self.para_gamma_b] + self.para_A_list + self.para_B_list + self.para_C_list
+        return [self.para_s, self.para_gamma_a] + gamma_b_params + self.para_A_list + self.para_B_list + self.para_C_list
 
 
     def coefficient_parameter_define(self, no_obs: bool = False, max_num: int = 10):
@@ -150,10 +188,22 @@ class robot:
         para_q_s: weight of state cost
         '''
 
-        diff_u = para_p_u * self.indep_u[0, :] - self.para_gamma_b
         diff_s = para_q_s * self.indep_s - self.para_gamma_a
 
-        C0_cost = cp.sum_squares(diff_s) + cp.sum_squares(diff_u) 
+        if self.kinematics in ['diff', 'acker']:
+            diff_u = para_p_u * self.indep_u[0, :] - self.para_gamma_b
+            C0_cost = cp.sum_squares(diff_s) + cp.sum_squares(diff_u) 
+        elif self.kinematics == 'omni':
+            if hasattr(self, 'para_gamma_b_omni'):
+                diff_u = para_p_u * self.indep_u - self.para_gamma_b_omni
+                C0_cost = cp.sum_squares(diff_s) + cp.sum_squares(diff_u)
+            else:
+                linear_vel_cost = para_p_u * cp.sum_squares(self.indep_u[0:2, :])
+                angular_vel_cost = para_p_u * cp.sum_squares(self.indep_u[2, :])
+
+                C0_cost = cp.sum_squares(diff_s) + linear_vel_cost + angular_vel_cost
+        else:
+            C0_cost = 0
 
         return C0_cost
 
@@ -217,31 +267,56 @@ class robot:
 
         constraints = []
 
-        constraints += [ cp.abs(self.indep_u[:, 1:] - self.indep_u[:, :-1] ) <= self.acce_bound ] 
-        constraints += [ cp.abs(self.indep_u) <= self.speed_bound]
+        if self.kinematics == 'omni':
+            u_dim = 3
+            if self.speed_bound.shape[0] != 3:
+                raise ValueError("For omni kinematics, speed_bound must have 3 elements [vx_max, vy_max, w_max].")
+            if self.acce_bound.shape[0] != 3:
+                raise ValueError("For omni kinematics, acce_bound must have 3 elements [ax_max, ay_max, alpha_max].")
+        else:
+            u_dim = 2
+            if self.speed_bound.shape[0] != 2:
+                raise ValueError(f"For {self.kinematics} kinematics, speed_bound must have 2 elements")
+            if self.acce_bound.shape[0] != 2:
+                raise ValueError(f"For {self.kinematics} kinematics, acce_bound must have 2 elements")
+
+        constraints += [ cp.abs(self.indep_u[:u_dim, 1:] - self.indep_u[:u_dim, :-1]) <= self.acce_bound[:u_dim] ] 
+        constraints += [ cp.abs(self.indep_u[:u_dim, :]) <= self.speed_bound[:u_dim] ]
         constraints += [ self.indep_s[:, 0:1] == self.para_s[:, 0:1] ]
 
         return constraints
     
 
     def generate_state_parameter_value(self, nom_s, nom_u, qs_ref_s, pu_ref_us):
-
-        state_value_list = [nom_s, qs_ref_s, pu_ref_us]
+        if self.kinematics == 'omni':
+            # For omni: [para_s, para_gamma_a, para_gamma_b, para_gamma_b_omni, A_list, B_list, C_list]
+            # Note: using pu_ref_us for both scalar and vector reference speeds
+            state_value_list = [nom_s, qs_ref_s, pu_ref_us, pu_ref_us]
+        else:
+            # For diff/acker: [para_s, para_gamma_a, para_gamma_b, A_list, B_list, C_list]
+            state_value_list = [nom_s, qs_ref_s, pu_ref_us]
 
         tensor_A_list = []
         tensor_B_list = []
         tensor_C_list = []
 
+        if self.kinematics in ['omni']:
+            u_dim = 3
+        else:
+            u_dim = 2
+
         for t in range(self.T):
             nom_st = nom_s[:, t:t+1]
-            nom_ut = nom_u[:, t:t+1]
+            nom_ut = nom_u[:u_dim, t:t+1]
 
             if self.kinematics == 'acker':
                 A, B, C = self.linear_ackermann_model(nom_st, nom_ut, self.dt, self.L)
-            elif self.kinematics == 'diff':
+            elif self.kinematics == 'diff': 
                 A, B, C = self.linear_diff_model(nom_st, nom_ut, self.dt)
+            elif self.kinematics == 'omni':
+                A, B, C = self.linear_omni_model(nom_st, nom_ut, self.dt)
             else:
-                raise ValueError('kinematics currently only supports acker or diff')
+                raise ValueError('kinematics currently only supports acker, diff, or omni')
 
             tensor_A_list.append(A)
             tensor_B_list.append(B)
@@ -286,6 +361,31 @@ class robot:
                         [ 0 ]])
                 
         return to_device(A), to_device(B), to_device(C) 
+    
+    def linear_omni_model(self, nom_st, nom_ut, dt):
+        phi = nom_st[2, 0]
+        vx, vy = nom_ut[0, 0], nom_ut[1, 0]
+
+        A = torch.Tensor([
+            [1, 0, (-vx * sin(phi) - vy * cos(phi)) * dt],
+            [0, 1, (vx * cos(phi) - vy * sin(phi)) * dt],
+            [0, 0, 1]   
+        ])
+
+        B = torch.Tensor([
+            [cos(phi) * dt, -sin(phi) * dt, 0],
+            [sin(phi) * dt, cos(phi) * dt, 0],
+            [0, 0, dt]
+        ])
+
+        C = torch.Tensor([
+            [(vx * sin(phi) + vy * cos(phi)) * phi * dt],
+            [(-vx * cos(phi) + vy * sin(phi)) * phi * dt],
+            [0]
+        ])
+
+        return to_device(A), to_device(B), to_device(C)
+
 
 
 
