@@ -116,7 +116,16 @@ class InitialPath:
         ref_s = np.hstack(state_ref_list)
 
         gear_array = np.array(gear_list)
-        ref_us = gear_array * ref_speed
+
+        if self.robot.kinematics == "omni":
+            ref_us = np.zeros((2, self.T))
+            for t in range(self.T):
+                theta = state_ref_list[t+1][2, 0]
+                v = ref_speed * gear_array[t]
+                ref_us[0, t] = v * cos(theta)
+                ref_us[1, t] = v * sin(theta) 
+        else:
+            ref_us = gear_array * ref_speed
 
         return nom_s, nom_u, ref_s, ref_us
 
@@ -378,6 +387,9 @@ class InitialPath:
         elif self.robot.kinematics == "diff":
             next_state = self.diff_model(robot_state, vel, sample_time)
 
+        elif self.robot.kinematics == "omni":
+            next_state = self.omni_model(robot_state, vel, sample_time)
+
         return next_state
 
     def ackermann_model(self, car_state, vel, wheel_base, sample_time):
@@ -410,6 +422,19 @@ class InitialPath:
         next_state = robot_state + ds * sample_time
 
         # next_state[2, 0] = wraptopi(next_state[2, 0])
+
+        return next_state
+
+    def omni_model(self, robot_state, vel, sample_time):
+
+        assert robot_state.shape == (3, 1) and vel.shape == (2, 1)
+
+        vx = vel[0, 0]
+        vy = vel[1, 0]
+
+        ds = np.array([[vx], [vy], [0]])
+
+        next_state = robot_state + ds * sample_time
 
         return next_state
 
